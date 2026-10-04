@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Runs the pre-commit hooks from prek.toml (ShellCheck and file hygiene)
+      # on all files.
+      - uses: j178/prek-action@v3.0.0
+
+  commit-messages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the check needs the history of the pushed range
+      - uses: j178/prek-action@v3.0.0
+        with:
+          install-only: true
+      # Runs the commit-msg hooks from prek.toml (commitlint) on each commit
+      # in the push or pull request.
+      - name: Check commit messages
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: .github/scripts/check-commit-messages.sh "$BASE" "$HEAD"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mosquitto mosquitto-clients jq
+      - name: Run tests
+        run: PATH="$PATH:/usr/sbin" tests/run.sh

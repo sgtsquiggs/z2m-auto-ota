@@ -1,0 +1,35 @@
+[Unit]
+Description=Install pending Zigbee2MQTT OTA updates, one device at a time
+Documentation=https://github.com/sgtsquiggs/z2m-auto-ota
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/z2m-auto-ota
+# The config may hold the MQTT password. LoadCredential hands a private copy
+# to the service, so the file itself can stay readable by root only.
+LoadCredential=config:/etc/z2m-auto-ota.conf
+# The script stops starting new updates after OTA_WINDOW and gives up on a
+# single update after OTA_UPDATE_TIMEOUT; this is only a backstop.
+TimeoutStartSec=12h
+
+# Sandboxing: the script only needs to reach the MQTT broker.
+DynamicUser=yes
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native

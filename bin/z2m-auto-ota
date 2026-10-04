@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# z2m-auto-ota: install pending Zigbee2MQTT OTA firmware updates, one device at a time.
+#
+# Zigbee2MQTT checks for firmware updates on its own but never installs them.
+# This script asks Zigbee2MQTT, over its MQTT API, to check each OTA-capable
+# device. When an update is available it installs it and waits for it to
+# finish before moving on. One update at a time keeps the Zigbee network
+# responsive and avoids the timeouts that concurrent updates cause. Devices
+# that need several firmware steps get up to OTA_MAX_STEPS updates per run.
+#
+# See README.md for installation and configuration.
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly PROG="z2m-auto-ota"
+readonly DEFAULT_CONFIG="/etc/z2m-auto-ota.conf"
+
+usage() {
+    cat <<EOF
+Usage: $PROG [--dry-run] [--config FILE]
+
+Install pending Zigbee2MQTT OTA updates, one device at a time.
+
+Options:
+  -n, --dry-run      Check for updates and report them, but install nothing.
+  -c, --config FILE  Read settings from FILE (KEY=VALUE lines). Default:
+                     \$CREDENTIALS_DIRECTORY/config when run by systemd,
+                     otherwise $DEFAULT_CONFIG if it exists.
+  -h, --help         Show this help.
+  -V, --version      Show the version.
+
+Exit status:
+  0    nothing failed (including nothing to update, the update window ending,
+       or the run ending because another update was already running)
+  1    Zigbee2MQTT was offline, the broker was unreachable or the connection
+       dropped, or a check or update failed
+  2    usage or configuration error, or a missing dependency
+  130  interrupted (SIGINT or SIGTERM, e.g. systemctl stop)
+EOF
+}
+
+# --- Logging ----------------------------------------------------------------
+
+log() {
+    local level=$1
+    shift
+    if [[ -t 2 ]]; then
+        printf '%s %-5s %s\n' "$(date '+%F %T')" "$level" "$*" >&2
+    else
+        printf '%-5s %s\n' "$level" "$*" >&2 # journald adds timestamps
+    fi
+}
+info() { log INFO "$@"; }
+warn() { log WARN "$@"; }
+error() { log ERROR "$@"; }
+die() {
+    error "$@"
+    exit 2
+}
+
+# --- Configuration ----------------------------------------------------------
+
+# Defaults. Every setting here can be changed in the config file.
+Z2M_MQTT_HOST=localhost
+Z2M_MQTT_PORT=1883
+Z2M_MQTT_USER=
+Z2M_MQTT_PASSWORD=
+Z2M_BASE_TOPIC=zigbee2mqtt
+OTA_EXCLUDE=
+OTA_INCLUDE_BATTERY=false
+OTA_MAX_STEPS=5
+OTA_WINDOW=14400
+OTA_CHECK_TIMEOUT=300
+OTA_UPDATE_TIMEOUT=14400
+OTA_ACTIVITY_LISTEN=90
+
+readonly SETTINGS=(
+    Z2M_MQTT_HOST Z2M_MQTT_PORT Z2M_MQTT_USER Z2M_MQTT_PASSWORD Z2M_BASE_TOPIC
+    OTA_EXCLUDE OTA_INCLUDE_BATTERY OTA_MAX_STEPS OTA_WINDOW OTA_CHECK_TIMEOUT OTA_UPDATE_TIMEOUT
+    OTA_ACTIVITY_LISTEN
+)
+
+is_setting() {
+    local name
+    for name in "${SETTINGS[@]}"; do
+        if [[ $name == "$1" ]]; then return 0; fi
+    done
+    return 1
+}
+
+# Read KEY=VALUE lines. The file is parsed, never executed as shell code.
+load_config() {
+    local file=$1 line key value n=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line=${line#"${line%%[![:space:]]*}"}
+        [[ -z $line || $line == \#* ]] && continue
+        [[ $line == *=* ]] || die "$file:$n: expected KEY=VALUE"
+        key=${line%%=*}
+        value=${line#*=}
+        is_setting "$key" || die "$file:$n: unknown setting '$key'"
+        if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+            value=${BASH_REMATCH[1]}
+        fi
+        printf -v "$key" '%s' "$value"
+    done <"$file"
+
+    local num
+    for num in Z2M_MQTT_PORT OTA_MAX_STEPS OTA_WINDOW OTA_CHECK_TIMEOUT OTA_UPDATE_TIMEOUT OTA_ACTIVITY_LISTEN; do
+        [[ ${!num} =~ ^[0-9]+$ ]] || die "$num must be a whole number, got '${!num}'"
+    done
+    [[ $OTA_INCLUDE_BATTERY == true || $OTA_INCLUDE_BATTERY == false ]] ||
+        die "OTA_INCLUDE_BATTERY must be true or false"
+    [[ -n $Z2M_BASE_TOPIC ]] || die "Z2M_BASE_TOPIC must not be empty"
+}
+
+# --- MQTT -------------------------------------------------------------------
+
+MQTT_DIR=
+SUB_PID=
+
+# mosquitto_pub/sub read default options from $XDG_CONFIG_HOME/<tool>.
+# Passing the connection settings that way keeps the password out of `ps`.
+setup_mqtt() {
+    MQTT_DIR=$(mktemp -d)
+    local tool
+    for tool in mosquitto_pub mosquitto_sub; do
+        {
+            printf -- '-h %s\n-p %s\n' "$Z2M_MQTT_HOST" "$Z2M_MQTT_PORT"
+            if [[ -n $Z2M_MQTT_USER ]]; then printf -- '-u %s\n' "$Z2M_MQTT_USER"; fi
+            if [[ -n $Z2M_MQTT_PASSWORD ]]; then printf -- '-P %s\n' "$Z2M_MQTT_PASSWORD"; fi
+        } >"$MQTT_DIR/$tool"
+    done
+    export XDG_CONFIG_HOME=$MQTT_DIR
+}
+
+stop_subscriber() {
+    if [[ -n $SUB_PID ]]; then
+        kill "$SUB_PID" 2>/dev/null || true
+        wait "$SUB_PID" 2>/dev/null || true
+        SUB_PID=
+    fi
+}
+
+cleanup() {
+    stop_subscriber
+    if [[ -n $MQTT_DIR ]]; then rm -rf "$MQTT_DIR"; fi
+}
+
+# Print the retained message on a topic, or fail if there is none.
+read_retained() {
+    mosquitto_sub -t "$1" -C 1 -W 10 2>/dev/null
+}
+
+# request <api> <device-id> <timeout-seconds>
+#
+# Send {"id": <device-id>} to <base>/bridge/request/<api> and print the
+# matching reply from <base>/bridge/response/<api>. Each request carries a
+# unique transaction id, which Zigbee2MQTT echoes back, so replies meant for
+# other clients (such as the web UI) are ignored. Returns 1 if no reply
+# arrives within the timeout, 2 if the broker cannot be reached or the
+# connection drops while waiting (a reply sent meanwhile would be lost).
+request() {
+    local api=$1 id=$2 timeout=$3
+    local tx="$PROG-$$-$RANDOM$RANDOM" payload line subscribed=false started=$SECONDS
+    payload=$(jq -nc --arg id "$id" --arg tx "$tx" '{id: $id, transaction: $tx}')
+
+    # -d prints protocol events, so we can wait for SUBACK before publishing
+    # and cannot miss a fast reply. stdbuf stops the output being held in a
+    # buffer while it goes to a pipe.
+    coproc SUB { exec stdbuf -oL mosquitto_sub -d -q 1 -W "$timeout" -t "$Z2M_BASE_TOPIC/bridge/response/$api" 2>&1; }
+
+    while IFS= read -r -t 15 line <&"${SUB[0]}"; do
+        if [[ $line == *"received SUBACK"* ]]; then
+            subscribed=true
+            break
+        fi
+    done
+    if [[ $subscribed != true ]]; then
+        stop_subscriber
+        return 2
+    fi
+
+    if ! mosquitto_pub -q 1 -t "$Z2M_BASE_TOPIC/bridge/request/$api" -m "$payload" 2>/dev/null; then
+        stop_subscriber
+        return 2
+    fi
+
+    while IFS= read -r line <&"${SUB[0]}"; do
+        if [[ $line == *"sending CONNECT"* ]]; then
+            # mosquitto_sub reconnects on its own after losing the broker.
+            # A reply published during the gap is gone, so do not keep waiting.
+            stop_subscriber
+            return 2
+        fi
+        [[ $line == \{* ]] || continue # skip the other debug lines
+        if jq -e --arg tx "$tx" '.transaction == $tx' <<<"$line" >/dev/null 2>&1; then
+            stop_subscriber
+            printf '%s\n' "$line"
+            return 0
+        fi
+    done
+    # mosquitto_sub exited: either its -W timeout or a broker error.
+    stop_subscriber
+    if ((SECONDS - started >= timeout)); then return 1; fi
+    return 2
+}
+
+# Print the name of a device that reports an update in progress, if any.
+# While a device updates, Zigbee2MQTT publishes its progress to the device's
+# state topic every 30 to 40 seconds. Listening for OTA_ACTIVITY_LISTEN seconds
+# therefore catches an update started outside this script, on any device.
+find_running_update() {
+    local fd pid topic payload found=1
+    exec {fd}< <(exec stdbuf -oL mosquitto_sub -R -t "$Z2M_BASE_TOPIC/#" -F '%t\t%p' -W "$OTA_ACTIVITY_LISTEN" 2>/dev/null)
+    pid=$!
+    while IFS=$'\t' read -r topic payload <&"$fd"; do
+        [[ $topic != "$Z2M_BASE_TOPIC/bridge/"* && $payload == *'"updating"'* ]] || continue
+        if jq -e '.update.state? == "updating"' <<<"$payload" >/dev/null 2>&1; then
+            printf '%s\n' "${topic#"$Z2M_BASE_TOPIC/"}"
+            found=0
+            break
+        fi
+    done
+    kill "$pid" 2>/dev/null || true
+    exec {fd}<&-
+    return "$found"
+}
+
+# --- Main -------------------------------------------------------------------
+
+# Print "<ieee address><TAB><friendly name>" for each device to consider.
+list_devices() {
+    local devices
+    devices=$(read_retained "$Z2M_BASE_TOPIC/bridge/devices") ||
+        { error "no device list on $Z2M_BASE_TOPIC/bridge/devices"; return 1; }
+    jq -r --argjson battery "$OTA_INCLUDE_BATTERY" '
+        .[]
+        | select(.type != "Coordinator" and .disabled != true and .supported == true)
+        | select(.definition.supports_ota == true)
+        | select($battery or ((.power_source // "") | test("^(Mains|DC)")))
+        | [.ieee_address, .friendly_name] | @tsv
+    ' <<<"$devices"
+}
+
+is_excluded() {
+    local entry
+    local -a entries
+    IFS=',' read -ra entries <<<"$OTA_EXCLUDE"
+    for entry in "${entries[@]}"; do
+        entry=${entry#"${entry%%[![:space:]]*}"}
+        entry=${entry%"${entry##*[![:space:]]}"}
+        if [[ -n $entry && ($entry == "$1" || $entry == "$2") ]]; then return 0; fi
+    done
+    return 1
+}
+
+# Describe one side of an update reply, e.g. "1.122.2 (file version 16786690)".
+# Zigbee2MQTT leaves out fields it does not know, sometimes the whole side.
+describe_version() {
+    jq -r "$1"' // {}
+        | [.software_build_id, (.file_version | if . == null then null else "(file version \(.))" end)]
+        | map(select(. != null)) | if length == 0 then "unknown version" else join(" ") end' <<<"$2"
+}
+
+main() {
+    local dry_run=false config=
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -n | --dry-run) dry_run=true ;;
+            -c | --config)
+                [[ $# -ge 2 ]] || die "$1 needs a file argument"
+                config=$2
+                shift
+                ;;
+            -h | --help) usage; exit 0 ;;
+            -V | --version) echo "$PROG $VERSION"; exit 0 ;;
+            *) usage >&2; exit 2 ;;
+        esac
+        shift
+    done
+
+    local cmd
+    for cmd in mosquitto_pub mosquitto_sub jq stdbuf; do
+        command -v "$cmd" >/dev/null || die "$cmd is required but not installed"
+    done
+
+    if [[ -z $config ]]; then
+        if [[ -n ${CREDENTIALS_DIRECTORY:-} && -r $CREDENTIALS_DIRECTORY/config ]]; then
+            config=$CREDENTIALS_DIRECTORY/config
+        elif [[ -r $DEFAULT_CONFIG ]]; then
+            config=$DEFAULT_CONFIG
+        fi
+    fi
+    if [[ -n $config ]]; then
+        [[ -r $config ]] || die "cannot read config file $config"
+        load_config "$config"
+    fi
+
+    # The update window starts now, before Zigbee2MQTT is contacted.
+    local deadline=$((SECONDS + OTA_WINDOW))
+
+    setup_mqtt
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
+
+    local state
+    state=$(read_retained "$Z2M_BASE_TOPIC/bridge/state") || {
+        error "no bridge state on $Z2M_BASE_TOPIC/bridge/state; is Zigbee2MQTT running, and are the MQTT settings right?"
+        return 1
+    }
+    # Zigbee2MQTT 1.x published a plain string; 2.x publishes {"state": "online"}.
+    state=$(jq -r 'if type == "object" then .state else . end' <<<"$state" 2>/dev/null || printf '%s' "$state")
+    if [[ $state != online ]]; then
+        error "Zigbee2MQTT is '$state', not online"
+        return 1
+    fi
+
+    local devices
+    devices=$(list_devices) || return 1
+    if [[ -z $devices ]]; then
+        info "no OTA-capable devices found"
+        return 0
+    fi
+
+    local failures=0 updated=0 ieee name step resp rc busy
+    if [[ $dry_run == true ]]; then
+        info "starting $PROG $VERSION (dry run)"
+    else
+        info "starting $PROG $VERSION"
+    fi
+
+    while IFS=$'\t' read -r ieee name; do
+        if is_excluded "$ieee" "$name"; then
+            info "$name: excluded, skipping"
+            continue
+        fi
+
+        for ((step = 1; step <= OTA_MAX_STEPS; step++)); do
+            if ((SECONDS >= deadline)); then
+                info "update window (${OTA_WINDOW}s) has ended; remaining devices wait for the next run"
+                break 2
+            fi
+
+            rc=0
+            resp=$(request device/ota_update/check "$ieee" "$OTA_CHECK_TIMEOUT") || rc=$?
+            if ((rc == 2)); then
+                error "$name: lost contact with the MQTT broker at $Z2M_MQTT_HOST:$Z2M_MQTT_PORT; ending this run"
+                failures=$((failures + 1))
+                break 2
+            elif ((rc != 0)); then
+                warn "$name: no reply to update check within ${OTA_CHECK_TIMEOUT}s"
+                failures=$((failures + 1))
+                break
+            fi
+            if [[ $(jq -r .status <<<"$resp") != ok ]]; then
+                local err
+                err=$(jq -r '.error // "unknown error"' <<<"$resp")
+                if [[ $err == *"already in progress"* ]]; then
+                    # Someone started an update outside this script. Starting
+                    # another now would run two at once.
+                    info "$name: an update is already in progress; ending this run so updates do not overlap"
+                    break 2
+                fi
+                warn "$name: update check failed: $err"
+                failures=$((failures + 1))
+                break
+            fi
+            if [[ $(jq -r .data.update_available <<<"$resp") != true ]]; then
+                if ((step == 1)); then info "$name: up to date"; fi
+                break
+            fi
+            if [[ $dry_run == true ]]; then
+                info "$name: update available (dry run, not installing)"
+                break
+            fi
+
+            # The check above only catches an update running on this device.
+            # Listen for progress from any other device before starting.
+            if ((OTA_ACTIVITY_LISTEN > 0)) && busy=$(find_running_update); then
+                info "an update is already running on $busy; ending this run so updates do not overlap"
+                break 2
+            fi
+            # The check and the listen take time, so look at the window again:
+            # no update may start after it ends.
+            if ((SECONDS >= deadline)); then
+                info "update window (${OTA_WINDOW}s) has ended; remaining devices wait for the next run"
+                break 2
+            fi
+
+            info "$name: installing update (step $step, at most $OTA_MAX_STEPS per run)"
+            rc=0
+            resp=$(request device/ota_update/update "$ieee" "$OTA_UPDATE_TIMEOUT") || rc=$?
+            if ((rc == 2)); then
+                # The update itself may carry on, so do not start another.
+                error "$name: lost contact with the MQTT broker at $Z2M_MQTT_HOST:$Z2M_MQTT_PORT during the update; ending this run"
+                failures=$((failures + 1))
+                break 2
+            elif ((rc != 0)); then
+                # Zigbee2MQTT carries on in the background. Starting another
+                # update now would run two at once, so end the run instead.
+                error "$name: update did not finish within ${OTA_UPDATE_TIMEOUT}s and may still be running; ending this run"
+                failures=$((failures + 1))
+                break 2
+            fi
+            if [[ $(jq -r .status <<<"$resp") != ok ]]; then
+                error "$name: update failed: $(jq -r '.error // "unknown error"' <<<"$resp")"
+                failures=$((failures + 1))
+                break
+            fi
+            info "$name: updated $(describe_version .data.from "$resp") -> $(describe_version .data.to "$resp")"
+            updated=$((updated + 1))
+        done
+    done <<<"$devices"
+
+    info "finished: $updated update(s) installed, $failures failure(s)"
+    ((failures == 0))
+}
+
+main "$@"

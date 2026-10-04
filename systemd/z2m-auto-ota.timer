@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly Zigbee2MQTT OTA updates
+Documentation=https://github.com/sgtsquiggs/z2m-auto-ota
+
+[Timer]
+# Run at night, when a light briefly restarting after its update bothers no one.
+# Change the schedule with: systemctl edit z2m-auto-ota.timer
+OnCalendar=*-*-* 02:00
+RandomizedDelaySec=15min
+# Do not catch up on missed runs at boot; that could start an update by day.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

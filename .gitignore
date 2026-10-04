@@ -1,0 +1,3 @@
+# Local config copies; the real config lives in /etc/z2m-auto-ota.conf.
+*.conf
+!z2m-auto-ota.conf.example

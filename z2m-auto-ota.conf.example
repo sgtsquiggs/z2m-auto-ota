@@ -1,0 +1,40 @@
+# z2m-auto-ota configuration. Installed to /etc/z2m-auto-ota.conf.
+# Format: KEY=VALUE, one per line, with no spaces around the =. Lines starting
+# with # are ignored; a # later in a line is part of the value, so keep
+# comments on their own lines. Every setting is optional; the values shown are
+# the defaults.
+
+# --- MQTT broker that Zigbee2MQTT uses ---
+Z2M_MQTT_HOST=localhost
+Z2M_MQTT_PORT=1883
+# Leave empty if the broker allows anonymous clients.
+Z2M_MQTT_USER=
+Z2M_MQTT_PASSWORD=
+# Must match mqtt.base_topic in Zigbee2MQTT's configuration.yaml.
+Z2M_BASE_TOPIC=zigbee2mqtt
+
+# --- Which devices to update ---
+# Comma-separated friendly names or IEEE addresses to never update.
+# Example: OTA_EXCLUDE=Garage Door Sensor,0x00124b0012345678
+OTA_EXCLUDE=
+# Battery devices sleep most of the time, so their checks are slow and often
+# time out. They are skipped unless this is true.
+OTA_INCLUDE_BATTERY=false
+
+# --- Timing (seconds) ---
+# Some devices need several firmware steps to reach the latest version.
+# This caps how many updates one device gets per run.
+OTA_MAX_STEPS=5
+# No new update starts once this long has passed since the run began.
+# An update already in progress is allowed to finish, so a run can last up to
+# OTA_WINDOW + OTA_UPDATE_TIMEOUT.
+OTA_WINDOW=14400
+# How long to wait for Zigbee2MQTT to answer an update check.
+OTA_CHECK_TIMEOUT=300
+# How long to wait for a single update to finish. If it runs over, the run
+# ends so that two updates never overlap.
+OTA_UPDATE_TIMEOUT=14400
+# Before each update, listen this long for progress reports from updates
+# started elsewhere, e.g. from the web UI. If one is running, the run ends.
+# Zigbee2MQTT reports progress every 30 to 40 seconds. 0 turns this off.
+OTA_ACTIVITY_LISTEN=90

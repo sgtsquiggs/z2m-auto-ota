@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# A stand-in for Zigbee2MQTT's OTA API, used by tests/run.sh.
+#
+# Usage: fake-z2m <base-topic> <state-dir>
+#
+# Publishes a retained bridge state and device list, then answers
+# device/ota_update/check and device/ota_update/update requests. Per-device
+# behaviour comes from files in <state-dir>:
+#   pending/<ieee>  number of updates still available (missing means 0)
+#   fail/<ieee>     updates to this device fail
+#   hang/<ieee>     updates to this device never get a reply
+#   sparse/<ieee>   update replies leave out version fields, as some real ones do
+#   busy/<ieee>     an update started elsewhere is running: checks fail with
+#                   "already in progress", and progress is published to the
+#                   device's state topic every second
+# Every request is appended to <state-dir>/requests as "<api> <ieee>".
+# MQTT connection options come from $XDG_CONFIG_HOME, as for the real script.
+
+set -euo pipefail
+
+base=$1
+dir=$2
+here=$(dirname "$0")
+
+mosquitto_pub -r -t "$base/bridge/state" -m '{"state":"online"}'
+mosquitto_pub -r -t "$base/bridge/devices" -f "$here/devices.json"
+
+respond() {
+    mosquitto_pub -t "$base/bridge/response/$1" -m "$2"
+}
+
+# Publish progress for busy devices, as Zigbee2MQTT does during an update.
+publish_progress() {
+    local file ieee name
+    while true; do
+        for file in "$dir"/busy/*; do
+            [[ -e $file ]] || continue
+            ieee=${file##*/}
+            name=$(jq -r --arg ieee "$ieee" '.[] | select(.ieee_address == $ieee) | .friendly_name' "$here/devices.json")
+            mosquitto_pub -t "$base/$name" -m '{"state":"ON","update":{"state":"updating","progress":42.5,"remaining":600}}'
+        done
+        sleep 1
+    done
+}
+publish_progress &
+progress=$!
+
+# Read requests through a FIFO rather than a pipeline, so the subscriber's PID
+# is known and it can be stopped when this script is.
+mkfifo "$dir/requests.fifo"
+stdbuf -oL mosquitto_sub -v -t "$base/bridge/request/#" >"$dir/requests.fifo" &
+sub=$!
+trap 'kill "$sub" "$progress" 2>/dev/null' EXIT
+trap 'exit 0' TERM INT
+
+while read -r topic payload; do
+    api=${topic#"$base/bridge/request/"}
+    id=$(jq -r .id <<<"$payload")
+    tx=$(jq -r .transaction <<<"$payload")
+    echo "$api $id" >>"$dir/requests"
+    pending=$(cat "$dir/pending/$id" 2>/dev/null || echo 0)
+
+    case $api in
+        device/ota_update/check)
+            if [[ -e $dir/busy/$id ]]; then
+                respond "$api" "$(jq -nc --arg id "$id" --arg tx "$tx" \
+                    '{status: "error", transaction: $tx, data: {}, error: "Update or check for update already in progress for \($id)"}')"
+                continue
+            fi
+            respond "$api" "$(jq -nc --arg id "$id" --arg tx "$tx" --argjson avail "$((pending > 0))" \
+                '{status: "ok", transaction: $tx, data: {id: $id, update_available: ($avail == 1)}}')"
+            ;;
+        device/ota_update/update)
+            [[ -e $dir/hang/$id ]] && continue
+            # A reply for someone else's transaction, which the script must ignore.
+            respond "$api" '{"status":"ok","transaction":"someone-else","data":{}}'
+            if [[ -e $dir/fail/$id ]]; then
+                respond "$api" "$(jq -nc --arg id "$id" --arg tx "$tx" \
+                    '{status: "error", transaction: $tx, data: {}, error: "Update of \($id) failed (Timeout)"}')"
+            elif [[ -e $dir/sparse/$id ]]; then
+                echo $((pending - 1)) >"$dir/pending/$id"
+                respond "$api" "$(jq -nc --arg id "$id" --arg tx "$tx" \
+                    '{status: "ok", transaction: $tx, data: {id: $id, from: {software_build_id: "1.101.5", date_code: "20221031"}}}')"
+            else
+                echo $((pending - 1)) >"$dir/pending/$id"
+                respond "$api" "$(jq -nc --arg id "$id" --arg tx "$tx" --argjson n "$pending" \
+                    '{status: "ok", transaction: $tx, data: {id: $id,
+                      from: {software_build_id: "1.\(100 - $n).0", file_version: (1000 - $n)},
+                      to: {software_build_id: "1.\(101 - $n).0", file_version: (1001 - $n)}}}')"
+            fi
+            ;;
+    esac
+done <"$dir/requests.fifo"
